@@ -1,0 +1,455 @@
+---
+title: "R Notebook"
+---
+
+```{r}
+library(here)
+library(tidyverse)
+library(corrr)
+library(ComplexHeatmap)
+library(ggrastr)
+```
+
+```{r}
+doc_theme <- function(...) {
+  theme(axis.text = element_text(color = 'black'),
+                axis.ticks = element_line(color = 'black'),
+                plot.title = element_text(hjust = 0.5),
+                plot.subtitle = element_text(hjust = 0.5),
+                legend.key.size = unit(8, 'pt'),
+                panel.background = element_blank(),
+                panel.border = element_blank(),
+                plot.background = element_blank(), 
+                legend.background = element_blank(),
+                strip.background = element_blank())
+}
+theme_set(theme_classic(base_size = 8, base_family = 'Arial') +
+          doc_theme())
+```
+
+## Data 
+
+```{r}
+large_subpool_lognorms <- read_csv(here('data', 'interim', 'filtered_lognorms_cp1564.csv')) %>%
+  select(-`X1`)
+chip_file <- read_tsv(here('data', 'raw', 'CP1564_GRCh38_NCBI_strict_gene_20200612.chip'))
+gene_pathway_mapping <- read_csv(here('data', 'interim', 'genes_pathways.csv'))
+v2_avg_zscores <- read_csv(here('data', 'processed', 'Cas9_v2_avg_zscores.csv'))
+
+```
+
+## Growth screens
+
+```{r}
+colnames(large_subpool_lognorms) <- word(colnames(large_subpool_lognorms), 1, 1, sep='_')
+col_filtered_lognorms <- large_subpool_lognorms %>%
+  select(`Construct Barcode`:`EMCV #2`) # up until GFP column
+```
+
+## Calculating LFCs
+
+We first calculate log fold changes from pDNA
+
+```{r}
+lfc_pdna <- col_filtered_lognorms %>%
+  mutate(across(where(is.numeric), ~.x - pDNA)) %>%
+  select(-c(pDNA))
+lfc_pdna
+```
+
+We see that the two mock conditions are well correlated, so we'll combine them into one.
+
+```{r}
+get_density <- function(x, y, ...) {
+  # from slowkow https://slowkow.com/notes/ggplot2-color-by-density/
+  dens <- MASS::kde2d(x, y, ...)
+  ix <- findInterval(x, dens$x)
+  iy <- findInterval(y, dens$y)
+  ii <- cbind(ix, iy)
+  return(dens$z[ii])
+}
+
+dense_pdna_lfcs <- lfc_pdna %>%
+  mutate(density = get_density(`Mock #1`,
+                               `Mock #2`, n = 200))
+
+ggplot(dense_pdna_lfcs) +
+  aes(x = `Mock #1`, y = `Mock #2`, 
+      color = density) +
+  theme(aspect.ratio = 1) +
+  geom_point_rast(alpha = 0.3, show.legend = F, size = 1, 
+                  raster.dpi=300, pch = 16) +
+  ggpubr::stat_cor(aes(label = ..r.label..), size=2.5, family='Arial') +
+  scale_color_viridis_c(option = 'D') 
+```
+
+The fit spline is close enough to the abline that we'll just subtract the mock arm from all conditions
+
+```{r}
+mock_avg <- lfc_pdna %>%
+    mutate(mock_avg = (`Mock #1` + 
+                       `Mock #2`)/2)
+ggplot(mock_avg) +
+  aes(x = mock_avg, y = `SARS2 #1`) +
+  geom_point() +
+  geom_abline() +
+  geom_smooth(method = 'gam', formula = y ~ splines::ns(x, df = 4), color = '#8da0cb', size = 1) +
+  theme(aspect.ratio = 1)
+```
+
+```{r}
+lfc_mock <- mock_avg %>%
+  mutate(across(where(is.numeric), ~.x - mock_avg)) %>%
+  select(-c(mock_avg, `Mock #1`, 
+            `Mock #2`)) %>%
+  rename(`HKU5-SARS-CoV-1-S #1`= `SARS1-bat #1`, 
+         `HKU5-SARS-CoV-1-S #2`= `SARS1-bat #2`, 
+         `SARS-CoV-2 #1` = `SARS2 #1`, 
+         `SARS-CoV-2 #2` = `SARS2 #2`, 
+         `VSV-SARS-CoV-2-S #1`= `rcVSV-SARS2-S #1`, 
+         `VSV-SARS-CoV-2-S #2`= `rcVSV-SARS2-S #2`, 
+         `MERS-CoV #1` = `MERS-WT #1`, 
+         `MERS-CoV #2`= `MERS-WT #2`, 
+         `MERS-CoV T1015N #1` = `MERS-T1015 #1`, 
+         `MERS-CoV T1015N #2` = `MERS-T1015 #2`)
+```
+
+We see conditions grouping together as expected
+
+```{r}
+lfc_cors <- lfc_mock %>%
+  select(-c(`Construct Barcode`, `Construct IDs`)) %>%
+  cor()
+col_fun <- circlize::colorRamp2(c(-1, 0, 1), 
+                                c(scales::muted('blue'), "white", scales::muted('red')))  
+pdf(here('figures', 'raw-plots', 'secondary_condition_cor.pdf'), width = 4, height = 4)
+Heatmap(lfc_cors, col = col_fun, rect_gp = gpar(col = "white", lwd = 1), 
+        name = 'r', column_title = 'Secondary Screens LFC Correlation',
+        column_names_gp = gpar(fontsize = 6, font = 'Arial'),
+        row_names_gp = gpar(fontsize = 6, font = 'Arial'),
+        column_title_gp = gpar(fontsize = 7, font = 'Arial'), 
+        heatmap_width = unit(7, "cm"), heatmap_height = unit(7, "cm"), 
+        heatmap_legend_param = list(title_gp = gpar(fontsize = 6, font = "Arial"), 
+                                    labels_gp = gpar(fontsize = 6, font = 'Arial'), 
+                                    grid_height = unit(3, "mm"),
+                                    grid_width = unit(3, "mm")))
+dev.off()
+```
+
+## Calculating z-scores
+
+```{r}
+long_lfcs <- lfc_mock %>%
+  pivot_longer(-c(`Construct Barcode`, `Construct IDs`), names_to = 'infection', 
+               values_to = 'lfc') %>%
+  mutate(infection = word(infection, sep = ' #'))
+avg_lfcs <- long_lfcs %>%
+  group_by(`Construct Barcode`, `Construct IDs`, infection) %>%
+  summarise(avg_lfc = mean(lfc), .groups = 'drop')
+```
+
+We'll map controls to pseudogenes and z-score by intergenic controls
+
+```{r}
+control_genes <- chip_file %>%
+  select(`Gene Symbol`) %>%
+  filter(grepl('_', `Gene Symbol`)) %>%
+  mutate(stub = word(`Gene Symbol`, 1, -2, sep = '_'), 
+         num = as.integer(word(`Gene Symbol`, -1, -1, sep = '_')), 
+         ceil_num = ceiling(num/10), 
+         remapped_symbol = paste(stub, ceil_num, sep = '_'))
+control_map <- deframe(control_genes %>% select(`Gene Symbol`, remapped_symbol)) # list to remap controls
+```
+
+
+```{r}
+chip_lfcs <- avg_lfcs %>%
+  inner_join(chip_file, by=c('Construct Barcode' = 'Barcode Sequence'))
+ctl_remapped_chip_lfcs <- chip_lfcs %>%
+  mutate(`Gene Symbol` = recode(`Gene Symbol`, !!!control_map))
+intergenic_stats <- ctl_remapped_chip_lfcs %>%
+  filter(grepl('ONE_INTERGENIC_SITE', `Gene Symbol`)) %>%
+  group_by(infection) %>%
+  summarise(ctl_mean = mean(avg_lfc), ctl_sd = sd(avg_lfc), .groups='drop')
+gene_zscores <- ctl_remapped_chip_lfcs %>%
+  group_by(infection, `Gene Symbol`) %>%
+  summarise(avg_lfc = mean(avg_lfc), .groups='drop', 
+            n = n()) %>%
+  inner_join(intergenic_stats) %>%
+  mutate(z_score = (avg_lfc - ctl_mean)/(ctl_sd/sqrt(n))) %>%
+  select(-c(ctl_mean, ctl_sd)) %>%
+  mutate(p_value = 2*pnorm(-abs(z_score))) %>%
+  group_by(infection) %>%
+  mutate(fdr_bh = p.adjust(p_value, method = 'BH')) %>%
+  ungroup()
+```
+
+## Comparison with primary screen
+
+```{r}
+label_genes <- c('CTSL', 'TMPRSS2', 'ACE2', 'HMGB1', 'LY6E', 'SMARCA4', 'ARID1A', 'HIRA', 'CABIN1')
+sars2_zs <- gene_zscores %>%
+  filter(infection == 'SARS-CoV-2') %>%
+  arrange(-z_score)
+primary_secondary_zs <- sars2_zs %>%
+  select(`Gene Symbol`, z_score) %>%
+  rename(secondary_z = z_score) %>%
+  inner_join(v2_avg_zscores %>%
+               select(Gene, mean_z) %>%
+               rename(primary_z = mean_z), by = c('Gene Symbol' = 'Gene')) %>%
+  mutate(density = get_density(primary_z,
+                               secondary_z, n = 100), 
+         label = if_else(`Gene Symbol` %in% label_genes, `Gene Symbol`, NA_character_)) %>%
+  arrange(density)
+ggplot(primary_secondary_zs) +
+  aes(y = primary_z, x = secondary_z) +
+  theme(aspect.ratio = 1) +
+  geom_point(aes(color = density), size = 0.8, pch = 16,
+             show.legend = F) +
+  ggpubr::stat_cor(aes(label = ..r.label..), size=2.5, family='Arial') +
+  ylab('Primary screen\n(avg. residual z-score)') +
+  xlab('Secondary screen\n(avg. LFC z-score)') +
+  geom_hline(yintercept = 0, linetype = 'dashed') +
+  geom_vline(xintercept = 0, linetype = 'dashed') +
+  ggrepel::geom_label_repel(aes(label = label), size = 2.05, family = 'Arial', 
+                              label.padding = 0.08, min.segment.length = 0, 
+                            label.size = 0.2, box.padding = 0.1,
+                            point.size = 1.5,  
+                            alpha = 0.75) +
+
+  labs(subtitle = 'SARS-CoV-2') +
+  scale_color_viridis_c()
+ggsave(here('figures', 'raw-plots', 'secondary_primary_cor.svg'), 
+       width = 6.5, height = 6.5, units = 'cm', dpi=300)
+```
+
+## Scatter plot between conditions
+
+```{r}
+spread_zscores <- gene_zscores %>%
+  pivot_wider(id_cols = `Gene Symbol`, values_from = z_score, 
+              names_from = infection)
+```
+
+```{r}
+compare_infections <- function(z_scores, x, y, genes = c(), n_genes = 0) {
+  z_scores <- z_scores %>%
+    mutate(label_point = 
+             (rank(-abs(!!as.name(x))) <= n_genes) |
+             (rank(-!!as.name(x)) <= n_genes) |
+             (rank(-abs(!!as.name(y))) <= n_genes) |
+             (rank(-!!as.name(y)) <= n_genes) |
+             (rank(-!!as.name(x) - !!as.name(y) ) <= n_genes) |
+             (rank(!!as.name(x) + !!as.name(y) ) <= n_genes) |
+             (`Gene Symbol` %in% genes),
+      label = if_else(label_point, `Gene Symbol`, NA_character_),
+           density = get_density(!!as.name(x), !!as.name(y), n = 100)) %>%
+    arrange(density)
+  x_label <- paste(x, '(z-score)')
+  y_label <- paste(y, '(z-score)')
+  ggplot(z_scores) +
+    aes(y = !!as.name(y), x = !!as.name(x)) +
+    theme(aspect.ratio = 1) +
+    geom_point(aes(color = density), size = 0.8, pch = 16, show.legend = F) +
+    ylab(paste0(y, '\n(Z-scored avg. LFC)')) +
+    xlab(paste0(x, '\n(Z-scored avg. LFC)')) +
+    geom_hline(yintercept = 0, linetype = 'dashed') +
+    geom_vline(xintercept = 0, linetype = 'dashed') +
+    ggrepel::geom_label_repel(aes(label = label), size = 2.05, family = 'Arial', 
+                              label.padding = 0.08, min.segment.length = 0, box.padding = 0.25, 
+                              alpha = 0.75) +
+    ggpubr::stat_cor(aes(label = ..r.label..), size=2.5, family='Arial') +
+
+    scale_color_viridis_c() +
+    xlab(x_label) +
+    ylab(y_label) 
+
+} 
+
+compare_infections(spread_zscores, 'VSV-SARS-CoV-2-S', 
+                   'SARS-CoV-2', genes = label_genes, n_genes = 1)
+ggsave(here('figures', 'raw-plots', 'secondary_sars2_sars2vsv.svg'),
+       width = 5.5, height = 5.5, units = 'cm')
+```
+
+
+```{r}
+compare_infections(spread_zscores, 'HKU5-SARS-CoV-1-S', 
+                   'SARS-CoV-2', genes = label_genes, n_genes = 1)
+ggsave(here('figures', 'raw-plots', 'secondary_sars2_sars1.svg'),
+       width = 5.5, height = 5.5, units = 'cm')
+```
+
+```{r}
+compare_infections(spread_zscores, 'MERS-CoV', 
+                   'SARS-CoV-2', genes = label_genes, n_genes = 1)
+ggsave(here('figures', 'raw-plots', 'secondary_sars2_mers.svg'),
+       width = 5.5, height = 5.5, units = 'cm')
+```
+
+```{r}
+compare_infections(spread_zscores, 'EMCV', 
+                   'SARS-CoV-2', genes = label_genes, n_genes = 1)
+ggsave(here('figures', 'raw-plots', 'secondary_sars2_emcv.svg'),
+       width = 5.5, height = 5.5, units = 'cm')
+```
+
+```{r}
+compare_infections(spread_zscores, 'IAV-WSN', 
+                   'SARS-CoV-2', genes = label_genes, n_genes = 1)
+ggsave(here('figures', 'raw-plots', 'secondary_sars2_iavwsn.svg'),
+       width = 5.5, height = 5.5, units = 'cm')
+```
+
+## Heatmap
+
+```{r}
+infection_order <- c('SARS-CoV-2', 'VSV-SARS-CoV-2-S', 'HKU5-SARS-CoV-1-S', 'MERS-CoV', 'MERS-CoV T1015N', 
+                     'IAV-WSN', 'EMCV')
+sars2_ordered_zscore <- gene_zscores %>%
+  mutate(`Gene Symbol` = factor(`Gene Symbol`, levels = rev(sars2_zs$`Gene Symbol`)),
+         infection = factor(infection, levels=infection_order)) 
+```
+
+```{r}
+plot_term_heatmap <- function(z_scores, mapping, term) {
+  term_genes <- mapping %>%
+    filter(`term description` == term) %>%
+    select(Gene) %>%
+    unlist()
+  term_zscores <- z_scores %>%
+    filter(`Gene Symbol` %in% term_genes)
+  ggplot(term_zscores) +
+    aes(x = infection, y = `Gene Symbol`, fill = z_score) +
+    geom_tile() +
+    scale_fill_gradient2(midpoint = 0, 
+                         high = scales::muted("red"),
+                         mid = "white",
+                         low = scales::muted("blue")) +
+    coord_equal() +
+    theme(axis.text.x=element_text(angle=90, hjust=1, vjust = 0.5)) +
+    labs(subtitle = term) +
+    xlab('') +
+    ylab('') +
+    guides(fill = guide_colorbar(title = 'Z')) 
+
+}
+
+plot_term_heatmap(sars2_ordered_zscore, gene_pathway_mapping, 'SWI/SNF complex')
+ggsave(here('figures', 'raw-plots', 'secondary_swi_snf.svg'),
+       width = 6, height = 10, units = 'cm')
+```
+
+```{r}
+plot_genes_heatmap <- function(z_scores, genes, title) {
+  gene_zscores <- z_scores %>%
+    filter(`Gene Symbol` %in%genes)
+  ggplot(gene_zscores) +
+    aes(x = infection, y = `Gene Symbol`, fill = z_score) +
+    geom_tile() +
+    scale_fill_gradient2(midpoint = 0, 
+                         high = scales::muted("red"),
+                         mid = "white",
+                         low = scales::muted("blue")) +
+    coord_equal() +
+    theme(axis.text.x=element_text(angle=90, hjust=1, vjust = 0.5)) +
+    labs(subtitle = title) +
+    xlab('') +
+    ylab('') +
+    guides(fill = guide_colorbar(title = 'Z')) 
+
+} 
+
+plot_genes_heatmap(sars2_ordered_zscore, c('HIRA', 'ASF1A', 'UBN1', 'CABIN1'), 
+                   'HUCA complex')
+ggsave(here('figures', 'raw-plots', 'secondary_huca.svg'),
+       width = 6, height = 5, units = 'cm')
+```
+
+## PCA
+
+```{r}
+zscore_mat <- spread_zscores %>%
+  column_to_rownames('Gene Symbol')
+pca <- prcomp(zscore_mat, scale. = TRUE)
+x <- 1
+y <- 2
+ve <- pca$sdev^2 / sum(pca$sdev^2)
+PC <- paste0("PC", c(x, y))
+x.column <- PC[1]
+y.column <- PC[2]
+loadings.column <- 'rotation'
+lam <- pca$sdev[c(x, y)]
+ve <- ve[c(x, y)]
+labs <- paste0(PC, " (", round(ve * 100, 2), "%)")
+xlab <- labs[1]
+ylab <- labs[2]
+pca_x <- pca$x %>%
+  as.data.frame() %>%
+  rownames_to_column('Gene Symbol') 
+pca_label <- c(label_genes, pca_x %>% 
+                 top_n(12, -!!as.name(x.column)) %>%
+                 select(`Gene Symbol`) %>%
+                 unlist(), 
+               pca_x %>% 
+                 top_n(3, !!as.name(y.column)) %>%
+                 select(`Gene Symbol`) %>%
+                 unlist(), 
+               pca_x %>% 
+                 top_n(8, !!as.name(y.column) - !!as.name(x.column)) %>%
+                 select(`Gene Symbol`) %>%
+                 unlist())
+pca_x <- pca_x %>%
+  mutate(label = if_else(`Gene Symbol` %in% pca_label, `Gene Symbol`, NA_character_))
+pca_loadings <- pca[[loadings.column]] %>%
+  as.data.frame() 
+scaler <- min(max(abs(pca_x[[x.column]])) / max(abs(pca_loadings[[x.column]])),
+              max(abs(pca_x[y.column])) / max(abs(pca_loadings[[y.column]])))
+pca_loadings <- pca_loadings * scaler 
+pca_loadings <- pca_loadings %>%
+  rownames_to_column('condition') %>%
+  as_tibble() %>%
+  mutate(condition = factor(condition, levels = infection_order))
+ggplot(pca_x) +
+  aes(x = !!as.name(x.column), y = !!as.name(y.column)) +
+  geom_point(alpha = 0.33, size = 0.8, pch = 16) +
+  xlab(xlab) +
+  ylab(ylab) +
+  theme(aspect.ratio = ve[2]/ve[1], 
+        legend.position=c(1,0), 
+        legend.justification = c('right', 'bottom'), 
+        legend.background = element_rect(fill = alpha('white', 0.5))) +
+  geom_segment(data = pca_loadings, 
+               aes(x = 0, y = 0, xend = !!as.name(x.column), yend = !!as.name(y.column), color = condition),
+               arrow = grid::arrow(length = grid::unit(6, 'points'))) +
+  ggrepel::geom_label_repel(aes(label = label), size = 2.1, family = 'Arial', 
+                              label.padding = 0.08, min.segment.length = 0, 
+                            label.size = 0.2, box.padding = 0.1, 
+                            alpha = 0.8, data = pca_x %>% bind_rows(pca_loadings), point.padding = 0.05) +
+  scale_color_brewer(palette = 'Set2') +
+  labs(subtitle = 'Secondary Screens\n Principal Component Analysis')
+ggsave(here('figures', 'raw-plots', 'secondary_pca.svg'), width = 11.75, height = 5.75, 
+       units = 'cm')
+```
+
+```{r}
+gene_zscores
+```
+
+## Outputs
+
+```{r}
+output_zscores <- gene_zscores %>%
+  pivot_wider(id_cols = c(`Gene Symbol`, n), names_from = infection, values_from = z_score) %>%
+  rename(`n_guides` = n)
+```
+
+
+```{r}
+write_csv(output_zscores, here('data', 'processed', 'secondary_screens_z_scores_v3.csv'))
+write_csv(gene_zscores, here('data', 'interim', 'secondary_screens_gene_results_v2.csv'))
+```
+
+
+
+

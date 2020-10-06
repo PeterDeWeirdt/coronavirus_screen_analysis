@@ -1,0 +1,455 @@
+---
+title: "Calculating z-scores"
+---
+
+```{r}
+library(here)
+library(tidyverse)
+library(mgcv)
+library(splines)
+library(RColorBrewer)
+library(AUC)
+library(broom)
+library(ggtext)
+library(ggpointdensity)
+library(ggrepel)
+library(ggpubr)
+library(ggrastr)
+library(patchwork)
+```
+
+```{r}
+doc_theme <- function(...) {
+  theme(axis.text = element_text(color = 'black'),
+                axis.ticks = element_line(color = 'black'),
+                plot.title = element_text(hjust = 0.5),
+                plot.subtitle = element_text(hjust = 0.5),
+                legend.key.size = unit(8, 'pt'),
+                panel.background = element_blank(),
+                panel.border = element_blank(),
+                plot.background = element_blank(), 
+                legend.background = element_blank(),
+                strip.background = element_blank())
+}
+theme_set(theme_classic(base_size = 8, base_family = 'Arial') +
+          doc_theme())
+```
+
+```{r}
+prefix = 'other_coronaviruses_'
+lognorms <- read_csv(here('data', 'interim', 'other_corona_filtered_lognorms.csv')) %>%
+  select(-c(X1, pDNA_filter, `Match Bin I sum`, off_target_filter)) # X1 is old index
+chip_file <- read_tsv(here('data', 'interim', 'CP0070_Chlorocebus_sabeus_remapped.chip'))
+essential_genes <- read_tsv(here('data', 'raw', 'essential-genes.txt'), col_names = 'Gene')
+nonessential_genes <- read_tsv(here('data', 'raw', 'non-essential-genes.txt'), col_names = 'Gene')
+v2_avg_zscores <- read_csv(here('data', 'processed', 'Cas9_v2_avg_zscores.csv'))
+```
+
+```{r}
+long_lognorms <- lognorms %>%
+  pivot_longer(-c(`Construct Barcode`:`Construct IDs`), 
+               names_to = 'condition', values_to = 'lognorm')
+long_lfcs <- long_lognorms %>%
+  mutate(lfc = lognorm - pDNA) %>%
+  select(-c(pDNA, lognorm))
+```
+
+```{r}
+# shorten labels for plotting
+condition_map <- long_lfcs %>%
+  select(condition) %>%
+  distinct() %>%
+  mutate(label = word(condition, 1, 1, '_')) %>%
+  select(condition, label) 
+condition_map
+```
+
+### Heatmap of sgRNA correlations
+
+```{r}
+spread_lfcs <- long_lfcs %>%
+  inner_join(condition_map) %>%
+  select(-condition) %>%
+  pivot_wider(names_from = label, values_from = lfc)
+condition_cors <- spread_lfcs %>%
+  select(-c(`Construct Barcode`:`Construct IDs`)) %>%
+  cor()
+long_cors <- condition_cors %>%
+  as.data.frame() %>%
+  rownames_to_column('condition.x') %>%
+  pivot_longer(-condition.x, names_to = 'condition.y', values_to = 'r')
+# order correlations by hierarchical clustering
+cor_clust <- hclust(dist(condition_cors))
+cor_order <- tibble(condition = cor_clust$labels[cor_clust$order]) %>%
+  mutate(order = row_number())
+long_cors <- long_cors %>%
+  inner_join(cor_order, by = c('condition.x' = 'condition')) %>%
+  inner_join(cor_order, by = c('condition.y' = 'condition')) %>%
+  mutate(condition.x = fct_reorder(condition.x, order.x),
+         condition.y = fct_reorder(condition.y, order.y))
+ggplot(long_cors) +
+  aes(x = condition.x, y = condition.y, fill = r) +
+  geom_tile() +
+  scale_fill_gradient(low = '#fff7ec', high = '#7f0000', limits = c(0,1)) +
+  coord_equal() +
+  xlab('condition x') +
+  ylab('condition y') +
+  theme(axis.text.x=element_text(angle=90, hjust=1, vjust = 0.5)) +
+  labs(subtitle = 'sgRNA LFC correlations')
+
+ggsave(here('figures', 'raw-plots', paste0(prefix ,'lfc_cors.svg')), width = 3, height = 3, units = 'in')
+```
+
+```{r}
+rep_map <- condition_map %>%
+  mutate(treatment = str_squish(word(label, 1, 1, sep='#')),
+         rep = str_squish(word(label, 2, 2, sep='#'))) %>%
+  mutate(treatment = fct_recode(treatment, 'HKU5-SARS-CoV-1-S' = 'SARS1-Bat', 
+                               'VSV-SARS-CoV-2-S' = 'VSV-SARS2', 
+                               'MERS-CoV' = 'MERS-WT', 
+                               'MERS-CoV T1015N' = 'MERS-T1015'))
+long_avg_lfcs <- long_lfcs %>%
+  inner_join(rep_map) %>%
+  group_by(`Construct Barcode`, `Construct IDs`, treatment) %>%
+  summarise(lfc = mean(lfc)) %>%
+  rename(condition = treatment) 
+long_avg_lfcs
+```
+
+### ROC-AUC
+
+Here we calculate the ROC-AUC between essentials/non-essentials for the mock infected condtions
+
+```{r}
+essential_chip <- chip_file %>% filter(Gene %in% essential_genes$Gene)
+nonessential_chip <- chip_file %>% filter(Gene %in% nonessential_genes$Gene)
+mock_roc_aucs <- long_lfcs %>%
+  filter(grepl('Mock', condition)) %>%
+  filter((`Construct Barcode` %in% essential_chip$`Barcode Sequence`) | # not merging to avoid duplicating guides
+           (`Construct Barcode` %in% nonessential_chip$`Barcode Sequence`)) %>%
+  mutate(essential = as.factor(`Construct Barcode` %in% essential_chip$`Barcode Sequence`)) %>% # otherwise nonessential
+  inner_join(condition_map) %>%
+  group_by(label) %>%
+  mutate(pct_rank = percent_rank(-lfc)) %>% # most negative lfc = 1
+  nest() %>%
+  mutate(roc = map(data, function(df) {
+    roc(df$pct_rank, df$essential)
+    }),
+    auc = map(roc, auc),
+    roc_df = map(roc, tidy)) 
+mock_AUCs <- mock_roc_aucs %>%
+  unnest(auc) %>%
+  select(-c(data, roc, roc_df))
+mock_rocs <- mock_roc_aucs %>%
+  unnest(roc_df) %>%
+  select(-c(data, roc, auc)) %>%
+  inner_join(mock_AUCs) %>%
+  ungroup() %>%
+  mutate(Condition = paste0(label, '\n(AUC = ', signif(auc, 2), ')'), 
+         Condition = fct_reorder(Condition, -auc)) 
+ggplot(mock_rocs) +
+  aes(x = fpr, y = tpr, color = Condition) +
+  geom_line() +
+  theme(aspect.ratio = 1, legend.key.height = unit(0.6, 'cm')) +
+  scale_color_brewer(palette = 'Set2') +
+  scale_x_continuous(n.breaks = 3) +
+  scale_y_continuous(n.breaks = 3) +
+  labs(subtitle = 'sgRNA ROC') +
+  ylab('tpr (essentials)') +
+  xlab('fpr (non-essentials)')
+ggsave(here('figures', 'raw-plots', paste0(prefix, 'roc_auc.svg')), width = 6, height = 6, units = 'cm')
+```
+
+```{r}
+length(unique(essential_chip$Gene))
+length(unique(nonessential_chip$Gene))
+
+```
+
+
+### Calculating Z-scores
+
+#### Guide level
+
+```{r}
+calculate_residuals <- function(lfc_df, compare_to = 'Mock') {
+  compare_cond <- lfc_df %>%
+    filter(grepl(compare_to, condition)) %>%
+    select(-condition) %>%
+    rename(lfc_x = lfc)
+  guide_residuals <- lfc_df %>%
+    filter(!grepl(compare_to, condition)) %>% # don't calculate residuals for "Mock"
+    inner_join(compare_cond) %>%
+    group_by(condition) %>%
+    mutate(residual = gam(lfc ~ ns(lfc_x, df = 4))$residual) %>%
+    ungroup()
+  return(guide_residuals)
+}
+# we calculate old and new residuals separately, since they rely on different reference conditions
+residuals <- calculate_residuals(long_avg_lfcs)
+```
+
+
+
+
+We'll use a representative condition to demonstrate the fit spline
+
+```{r}
+example_condition <- 'VSV-SARS-CoV-2-S'
+ACE2_guides <- chip_file$`Barcode Sequence`[chip_file$Gene == 'ACE2'] # not joining by chip again as to avoid duplication
+get_density <- function(x, y, ...) {
+  # from slowkow https://slowkow.com/notes/ggplot2-color-by-density/
+  dens <- MASS::kde2d(x, y, ...)
+  ix <- findInterval(x, dens$x)
+  iy <- findInterval(y, dens$y)
+  ii <- cbind(ix, iy)
+  return(dens$z[ii])
+}
+example_model <- residuals %>%
+  filter(condition == example_condition) %>%
+  mutate(density = get_density(lfc_x, lfc, n = 100))
+
+residual_example <- example_model %>% 
+                 filter(`Construct Barcode` %in% ACE2_guides) %>%
+                 top_n(1, residual) %>%
+                 mutate(line_y = lfc - residual)
+
+ggplot(example_model) +
+  aes(x = lfc_x, y = lfc) +
+  geom_point_rast(aes(color = density), alpha = 0.3, show.legend = F, size = 1, 
+                  raster.dpi=300, pch = 16) +
+  scale_color_viridis_c(option = 'D') +
+  theme(aspect.ratio = 1, plot.subtitle = element_markdown()) +
+  geom_point(data = example_model %>% filter(`Construct Barcode` %in% ACE2_guides), 
+             aes(fill = 'ACE2'), size = 2, pch = 21) +
+  scale_fill_manual(values = c('#66c2a5')) +
+  geom_smooth(method = 'gam', formula = y ~ ns(x, df = 4), color = '#8da0cb', size = 1) +
+  geom_segment(aes(x = lfc_x, y = lfc, xend = lfc_x, yend = line_y), 
+               data = residual_example, color = 'black', 
+               arrow = arrow(length = unit(4, 'pt'), ends = 'both')) +
+  geom_text_repel(aes(x = lfc_x, y = (lfc+line_y)/2), data = residual_example, 
+             label = 'residual', size = 2.5, nudge_x = -2.5, nudge_y = 2, family = 'Arial') +
+  labs(subtitle = "sgRNA model") +
+  xlab('Mock (LFC)') +
+  ylab(paste(example_condition, '(LFC)')) +
+  guides(fill = guide_legend(title = element_blank()))
+ggsave(here('figures', 'raw-plots', paste0(prefix, 'sgrna_model.pdf')), width = 5.75, 
+       height = 5.75, units = 'cm', dpi = 300, device = cairo_pdf) # saving as pdf to embed rasterized plot area
+```
+
+#### Gene level
+
+```{r}
+pop_stats <- residuals %>%
+  group_by(condition) %>%
+  summarise(pop_mean = mean(residual), pop_sd = sd(residual))
+```
+
+```{r}
+gene_zscores <- residuals %>%
+  inner_join(chip_file, by = c('Construct Barcode' = 'Barcode Sequence')) %>%
+  group_by(Gene, condition) %>%
+  summarise(n = n(),
+            mean_lfc = mean(lfc),
+            mean_residual = mean(residual)) %>%
+  ungroup() %>%
+  inner_join(pop_stats) %>%
+  mutate(z_score = (mean_residual - pop_mean)/(pop_sd/sqrt(n)),
+         p_value = 2*pnorm(-abs(z_score))) %>%
+  group_by(condition) %>%
+  mutate(fdr = p.adjust(p_value, method = 'BH'),
+         ascending_rank = rank(z_score),
+         descending_rank = rank(-z_score))  
+gene_zscores %>%
+  arrange(-z_score)
+```
+
+```{r}
+spread_zs <- gene_zscores %>% pivot_wider(id_cols = Gene, values_from = z_score, 
+                                          names_from = condition)
+joined_zs <- spread_zs %>% 
+  inner_join(v2_avg_zscores %>% 
+               select(Gene, mean_z) %>%
+               rename(`SARS-CoV-2` = mean_z)) %>%
+  mutate(Gene = as.character(fct_recode(Gene, 'HMGB1-like' = 'LOC103214541')))
+joined_zs
+```
+
+```{r}
+highlight_genes <- c('CTSL', 'TMPRSS2', 'ACE2', 'HMGB1-like', 'LY6E', 'SMARCA4', 'ARID1A', 'HIRA')
+compare_conditions <- function(x, y, zs, n_genes = 5, genes = c(), 
+                               segment_size = 0.1, label_size = 0.1, box_padding = 0.25,
+                               text_size = 2, label_color = 'black', segment_color = 'black', point_size = 2, 
+                               label_padding = 0.1, label_alpha = 0.8, point_padding = 1e-6) {
+  dense_zs <- zs %>%
+    mutate(density := get_density(!!as.name(x), !!as.name(y), n = 100))
+  x_label <- if_else(x == 'SARS-CoV-2', paste(x, '(avg. z-score)'), paste(x, '(z-score)'))
+  y_label <- if_else(y == 'SARS-CoV-2', paste(y, '(avg. z-score)'), paste(y, '(z-score)'))
+  ggplot(dense_zs) +
+    aes(x = !!as.name(x),  y = !!as.name(y)) +
+    geom_point_rast(aes(color = density), show.legend = F, 
+                    alpha = 0.5, size = point_size, pch = 16, raster.dpi = 300) +
+    scale_color_viridis_c() +
+    theme(aspect.ratio = 1) +
+    geom_label_repel(data = dense_zs %>% mutate(label_point = 
+                                            (rank(-abs(!!as.name(x))) <= n_genes) |
+                                            (rank(-!!as.name(x)) <= n_genes) |
+                                            (rank(-abs(!!as.name(y))) <= n_genes) |
+                                            (rank(-!!as.name(y)) <= n_genes) |
+                                            (rank(-!!as.name(x) - !!as.name(y) ) <= n_genes) |
+                                            (rank(!!as.name(x) + !!as.name(y) ) <= n_genes) |
+                                            (Gene %in% genes),
+                                          point_label = if_else(label_point, Gene, NA_character_)),
+                     aes(label = point_label), size = text_size, min.segment.length = 0, family = 'Arial', 
+                     label.padding = label_padding, label.size = label_size, segment.size = segment_size, 
+                     box.padding = box_padding, color = label_color, segment.color = segment_color, alpha = label_alpha, 
+                     point.padding = point_padding) +
+    stat_cor(aes(label = ..r.label..), size = 2.1, family = 'Arial') +
+    xlab(x_label) +
+    ylab(y_label) 
+}
+condition_order <- c('SARS-CoV-2', 'VSV-SARS-CoV-2-S', 'HKU5-SARS-CoV-1-S', 'MERS-CoV', 'MERS-CoV T1015N')
+for (i in 1:(length(condition_order) - 1)) {
+  for (j in (i+1):(length(condition_order))) {
+    cond_i = condition_order[i]
+    cond_j = condition_order[j]
+    comparison_plot <- compare_conditions(cond_j, cond_i, joined_zs, n_genes = 1, 
+                                          genes = highlight_genes, label_size = 0.2, 
+                                          segment_size = 0.5, box_padding = 0.15, point_size = 1.5,
+                                          text_size = 2.05, label_padding = 0.08, label_alpha=0.75, 
+                                          segment_color = 'black')
+    ggsave(here('figures', 'raw-plots', paste0(prefix, cond_i,  '_', cond_j,
+                                               '_genomewide_scatter_comaprisons.pdf')), width = 5.95, 
+       height = 5.95, units = 'cm', dpi = 300, device = cairo_pdf)
+    }
+}
+```
+
+```{r}
+long_zs <- joined_zs %>%
+  pivot_longer(cols = -c(Gene), values_to = 'z_score', names_to = 'condition')
+sars2_top <- long_zs %>%
+  filter(condition == 'SARS-CoV-2') %>%
+  top_n(20, z_score)
+mers_top <- long_zs %>%
+  filter(grepl('MERS-CoV', condition)) %>%
+  group_by(Gene) %>%
+  summarise(mean_z = mean(z_score), .groups = 'drop') %>%
+  top_n(5, mean_z)
+top_genes <- long_zs %>%
+  filter((Gene %in% sars2_top$Gene) | 
+           (Gene %in% mers_top$Gene), 
+         condition == 'SARS-CoV-2') %>%
+  arrange(z_score) %>%
+  select(Gene) %>%
+  unlist()
+zs_top <- long_zs %>%
+  filter(Gene %in% top_genes) %>%
+  inner_join(long_zs %>% 
+               filter(condition == 'SARS-CoV-2') %>% 
+               rename(SARS2_z = z_score) %>%
+               select(-condition)) %>%
+   mutate(condition = factor(condition, levels=condition_order), 
+         Gene_label = if_else(Gene %in% mers_top$Gene, paste0(Gene, '^*'), Gene),
+         Gene_label = fct_reorder(Gene_label, SARS2_z)) 
+
+```
+
+```{r}
+sars2_bottom <- long_zs %>%
+  filter(condition == 'SARS-CoV-2') %>%
+  top_n(20, -z_score)
+mers_bottom <- long_zs %>%
+  filter(grepl('MERS-CoV', condition)) %>%
+  group_by(Gene) %>%
+  summarise(mean_z = mean(z_score), .groups = 'drop') %>%
+  top_n(5, -mean_z)
+bottom_genes <- long_zs %>%
+  filter((Gene %in% sars2_bottom$Gene) | 
+           (Gene %in% mers_bottom$Gene), 
+         condition == 'SARS-CoV-2') %>%
+  arrange(-z_score) %>%
+  select(Gene) %>%
+  unlist()
+zs_bottom <- long_zs %>%
+  filter(Gene %in% bottom_genes) %>%
+  inner_join(long_zs %>% 
+               filter(condition == 'SARS-CoV-2') %>% 
+               rename(SARS2_z = z_score) %>%
+               select(-condition)) %>%
+   mutate(condition = factor(condition, levels=condition_order), 
+         Gene_label = if_else(Gene %in% mers_bottom$Gene, paste0(Gene, '^*'), Gene),
+         Gene_label = fct_reorder(Gene_label, -SARS2_z)) 
+```
+
+
+```{r}
+ggplot(zs_top) +
+  aes(x = condition, y = Gene_label, fill = z_score) +
+  geom_tile() +
+  scale_fill_gradient2(midpoint = 0, 
+                       high = scales::muted("red"),
+                       mid = "white",
+                       low = scales::muted("blue"), 
+                       limits = c(-max(abs(zs_bottom$z_score), abs(zs_top$z_score)), 
+                                  max(abs(zs_bottom$z_score), abs(zs_top$z_score)))) +
+  coord_equal() +
+  theme(axis.text.x=element_text(angle=90, hjust=1, vjust = 0.5), 
+        axis.text.y = element_markdown()) +
+  xlab('') +
+  ylab('') +
+  labs(subtitle = 'Resistance')
+ggsave(here('figures', 'raw-plots', paste0(prefix, 'resitence_heatmap.pdf')), width = 5.75, 
+       height = 11.75, units = 'cm', dpi = 300, device = cairo_pdf)
+```
+
+```{r}
+ggplot(zs_bottom) +
+  aes(x = condition, y = Gene_label, fill = z_score) +
+  geom_tile() +
+  scale_fill_gradient2(midpoint = 0, 
+                       high = scales::muted("red"),
+                       mid = "white",
+                       low = scales::muted("blue"), 
+                       limits = c(-max(abs(zs_bottom$z_score), abs(zs_top$z_score)), 
+                                  max(abs(zs_bottom$z_score), abs(zs_top$z_score)))) +
+  coord_equal() +
+  theme(axis.text.x=element_text(angle=90, hjust=1, vjust = 0.5), 
+        axis.text.y = element_markdown()) +
+  xlab('') +
+  ylab('') +
+  labs(subtitle = 'Sensitization')
+ggsave(here('figures', 'raw-plots', paste0(prefix, 'sensitization_heatmap.pdf')), width = 5.75, 
+       height = 11.75, units = 'cm', dpi = 300, device = cairo_pdf)
+```
+
+
+
+
+### Data outputs
+
+```{r}
+spread_zs <- gene_zscores %>%
+  pivot_wider(id_cols = c(Gene, n), names_from = condition, values_from = z_score) %>%
+  rename(`n_guides` = n) %>%
+  inner_join(v2_avg_zscores %>%
+               select(Gene, mean_z) %>%
+               rename(`SARS-CoV-2 Cas9-V2 Avg.` = mean_z))
+```
+
+
+```{r}
+# guide log-fold changes and residuals
+write_csv(residuals, here('data', 'interim', paste0(prefix,
+                                                    '_guide_lfcs_residuals.csv')))
+# condition mapping
+write_csv(condition_map, here('data', 'interim', paste0(prefix,
+                                                        'condition_mapping.csv')))
+# all condition z-scores
+write_csv(gene_zscores, here('data', 'interim', paste0(prefix, 'condition_gene_zscores.csv')))
+# z-scores averaged by condition
+write_csv(spread_zs, here('data', 'processed', paste0(prefix, 'spread_zscores_v2.csv')))
+```
+
+
+

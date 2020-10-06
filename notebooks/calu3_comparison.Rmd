@@ -1,0 +1,113 @@
+---
+title: "R Notebook"
+---
+
+```{r}
+library(here)
+library(tidyverse)
+```
+
+```{r}
+doc_theme <- function(...) {
+  theme(axis.text = element_text(color = 'black'),
+                axis.ticks = element_line(color = 'black'),
+                plot.title = element_text(hjust = 0.5),
+                plot.subtitle = element_text(hjust = 0.5),
+                legend.key.size = unit(8, 'pt'),
+                panel.background = element_blank(),
+                panel.border = element_blank(),
+                plot.background = element_blank(), 
+                legend.background = element_blank(),
+                strip.background = element_blank())
+}
+theme_set(theme_classic(base_size = 8, base_family = 'Arial') +
+          doc_theme())
+```
+
+```{r}
+lognorms <- read_csv(here('data', 'interim', 'filtered_lognorms_cp1560.csv'))
+v2_avg_zscores <- read_csv(here('data', 'processed', 'Cas9_v2_avg_zscores.csv'))
+guide_mapping <- read_csv(here('data', 'raw', 'cp1560_guide_mapping.csv'))
+```
+
+
+```{r}
+filtered_lfcs <- lognorms %>%
+  select(`Construct Barcode`, `Calu3-Mock_CP1560_Perturb`, `Calu3-SARS2_CP1560_Perturb`) %>%
+  mutate(lfc = `Calu3-SARS2_CP1560_Perturb` - `Calu3-Mock_CP1560_Perturb`) %>%
+  inner_join(guide_mapping)
+filtered_lfcs
+```
+
+```{r}
+control_stats <- filtered_lfcs %>%
+  filter(`Target Gene Symbol` == 'ONE_INTERGENIC_SITE') %>%
+  summarise(std = sd(lfc),
+            mean = mean(lfc))
+```
+
+
+```{r}
+avg_lfcs <- filtered_lfcs %>%
+  group_by(`Target Gene Symbol`) %>%
+  summarise(avg_lfc = mean(lfc),
+            n_guides = n(),
+            ctl_scaled_zscore = (avg_lfc - control_stats$mean)/(control_stats$std/sqrt(n_guides)))
+```
+
+```{r}
+avg_lfcs %>% arrange(ctl_scaled_zscore)
+```
+
+
+```{r}
+merged_scores <- avg_lfcs %>%
+  left_join(v2_avg_zscores %>% select(Gene, mean_z), 
+             by = c('Target Gene Symbol' = 'Gene'))
+n_genes <- 2
+#label_genes <- c('CTSL', 'TMPRSS2', 'ACE2', 'HMGB1', 'LY6E', 'SMARCA4', 'ARID1A', 'HIRA', 'CABIN1')
+x <- 'ctl_scaled_zscore'
+y <- 'mean_z'
+ggplot(merged_scores %>%
+         mutate(label_point = 
+             (rank(-abs(!!as.name(x))) <= n_genes) |
+             (rank(-!!as.name(x)) <= n_genes) |
+             (rank(-abs(!!as.name(y))) <= n_genes) |
+             (rank(-!!as.name(y)) <= n_genes) |
+             (rank(-!!as.name(x) - !!as.name(y) ) <= n_genes) |
+             (rank(!!as.name(x) + !!as.name(y) ) <= n_genes),
+             #(`Target Gene Symbol` %in% label_genes),
+      label = if_else(label_point, `Target Gene Symbol`, NA_character_))) +
+  aes(x = ctl_scaled_zscore, y = mean_z) +
+  theme(aspect.ratio = 1) +
+  geom_point(size=1, alpha = 0.4, pch = 16) +
+  ggpubr::stat_cor(size=2.2, family='Arial', label.x.npc = 0.4, label.y.npc = 0) +
+  ylab('SARS-CoV-2 Vero-E6 \ngenome-wide (avg. residual z-score)') +
+  xlab('SARS-CoV-2 CALU3 focused\nlibrary(avg. LFC z-score)') +
+  geom_hline(yintercept = 0, linetype = 'dashed') +
+  geom_vline(xintercept = 0, linetype = 'dashed') + 
+  ggrepel::geom_label_repel(
+                           aes(label = label), size = 2.1, family = 'Arial', 
+                              label.padding = 0.08, min.segment.length = 0, 
+                            label.size = 0.2, box.padding = 0.25, segment_size=1, 
+                            alpha = 0.8) 
+ggsave(here('figures', 'raw-plots', 'CALU3_Vero_focused_comparison.pdf'), 
+       width = 5.5, height = 5.5, units = 'cm', device = cairo_pdf)
+  
+```
+
+```{r}
+out_scores <- merged_scores %>%
+  rename(`CALU3 Avg. LFC` = avg_lfc, `CALU3 Avg. LFC scaled to controls` = ctl_scaled_zscore, 
+         `Vero-E6 Z-score` = mean_z)
+out_scores
+```
+
+```{r}
+out_lfcs <- avg_lfcs %>%
+  select(`Target Gene Symbol`, n_guides, ctl_scaled_zscore) %>%
+  rename(`CALU3 Tertiary` = ctl_scaled_zscore)
+write_csv(out_scores, here('data', 'processed', 'calu3_vero_avg_lfc_v1.csv'))
+write_csv(out_lfcs, here('data', 'processed', 'calu3_zscore_v1.csv'))
+```
+

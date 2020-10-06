@@ -1,0 +1,211 @@
+---
+title: "Gene set enrichment"
+---
+
+```{r}
+library(tidyverse)
+library(here)
+library(ggrepel)
+library(broom)
+library(ggraph)
+library(tidygraph)
+```
+
+```{r}
+doc_theme <- function(...) {
+  theme(axis.text = element_text(color = 'black'),
+                axis.ticks = element_line(color = 'black'),
+                plot.title = element_text(hjust = 0.5),
+                plot.subtitle = element_text(hjust = 0.5),
+                legend.key.size = unit(8, 'pt'),
+                panel.background = element_blank(),
+                panel.border = element_blank(),
+                plot.background = element_blank(), 
+                legend.background = element_blank(),
+                strip.background = element_blank())
+}
+theme_set(theme_classic(base_size = 8, base_family = 'Arial') +
+          doc_theme())
+```
+
+```{r}
+enrichment_files <- c('enrichment.InterPro.tsv', 'enrichment.Keyword.tsv', 'enrichment.RCTM.tsv', 
+                      'enrichment.Component.tsv', 'enrichment.Function.tsv' , 'enrichment.Process.tsv', 
+                      'enrichment.Pfam.tsv', 'enrichment.SMART.tsv',
+                      'enrichment.KEGG.tsv', 'enrichment.NetworkNeighborAL.tsv')
+enrichment_list <- list()
+for (file in enrichment_files) {
+  enrichment_list[[file]] <- read_tsv(here('data','external', 'string_enriched_pathways', file))
+}
+enrichment_df <- bind_rows(enrichment_list) %>%
+  arrange(-`enrichment score`)
+gene_scores <- read_csv(here('data', 'processed', 'Cas9_v2_avg_zscores.csv'))
+string_mapped_genes <- read_csv(here('data', 'interim', 'string_mapped_genes.csv'))
+```
+
+```{r}
+dim(enrichment_df)
+length(enrichment_files)
+```
+
+
+```{r}
+enrichment_df_rank <- enrichment_df %>%
+  mutate(direction = fct_recode(direction, negative = 'top of list', 
+                                both = 'both ends', positive = 'bottom of list') %>%
+           fct_relevel('positive', 'both', 'negative')) %>%
+  mutate(enrichment_rank = rank(-`enrichment score`), # highest enrichment will have a value of 1
+         fdr_rank = rank(`false discovery rate`), 
+         mean_rank = (enrichment_rank + fdr_rank)/2)
+significant_pathways_gene_scores <- enrichment_df_rank %>%
+  select(-`matching proteins in your input (IDs)`) %>%
+  separate_rows(`matching proteins in your input (labels)`, sep =',') %>%
+  inner_join(string_mapped_genes, by = c('matching proteins in your input (labels)' = 'preferredName')) %>%
+  inner_join(gene_scores, by = c('queryItem' = 'Gene')) 
+pathway_summaries <- significant_pathways_gene_scores %>%
+  group_by(`#term ID`, `term description`, `enrichment score`, direction, 
+           `false discovery rate`, `genes mapped`,
+           enrichment_rank, fdr_rank, mean_rank) %>%
+  summarise(n = n(),
+            mean_abs_z = mean(abs(mean_z)),
+            median_abs_z = median(abs(mean_z)),
+            abs_max_z = mean_z[which.max(abs(mean_z))],
+            mean_z = mean(mean_z)) %>%
+  ungroup() 
+pathway_overlap <- significant_pathways_gene_scores %>%
+  inner_join(significant_pathways_gene_scores, by = c('queryItem')) 
+list_intersection <- pathway_overlap %>%
+  filter(`#term ID.x` < `#term ID.y`) %>% # deuplicate
+  group_by(`#term ID.x`,`#term ID.y`) %>%
+  summarise(intersection = n()) %>%
+  ungroup()
+term_n <- pathway_summaries %>%
+  select(`#term ID`, n)
+total_genes <- nrow(string_mapped_genes)
+contingency_df <- list_intersection %>%
+  inner_join(term_n, by = c('#term ID.x' = '#term ID')) %>%
+  inner_join(term_n, by = c('#term ID.y' = '#term ID')) %>%
+  mutate(unique.x = n.x - intersection,
+         unique.y = n.y - intersection, 
+         other_genes = total_genes - (unique.x + unique.y + intersection)) 
+fisher_df <- contingency_df %>%
+  group_by(`#term ID.x`,`#term ID.y`) %>%
+  nest() %>%
+  mutate(fisher = map(data, function(df) {
+    tidy(fisher.test(matrix(c(df$other_genes, df$unique.x, 
+                              df$unique.y, df$intersection), nrow = 2)))
+    })) %>%
+  ungroup() %>%
+  unnest(fisher) %>%
+  select(-data) %>%
+  mutate(fdr = p.adjust(p.value, method = 'BH'))
+edge_cutoff <- 0.01
+filtered_fisher <- fisher_df %>%
+  filter(fdr < edge_cutoff) %>%
+  inner_join(contingency_df) %>%
+  mutate(intersection_fraction = intersection/(unique.x + unique.y + intersection))
+```
+
+```{r, fig.width=7, fig.height=7}
+set.seed(2)
+network <- as_tbl_graph(filtered_fisher, directed = F) %>%
+  left_join(pathway_summaries, by = c('name' = '#term ID')) %>%
+  mutate(module = as.factor(group_infomap(weights = intersection_fraction,
+                                          node_weights = mean_abs_z))) %>%
+  morph(to_split, module) %>%
+  mutate(module_centrality = centrality_pagerank(weights = intersection_fraction, 
+                                                 personalized = mean_abs_z, 
+                                                 damping = 0.5),
+         module_centrality_rank = rank(-module_centrality),
+         module_z_rank = rank(-mean_abs_z)) %>%
+  unmorph() 
+set.seed(2)
+network_layout <- network %>%
+  create_layout('fr', weights = intersection_fraction)
+ggraph(network %>% mutate(label = if_else((module_centrality_rank <= 1), 
+                                          str_trunc(str_wrap(`term description`, 20), 56), 
+                                          NA_character_)), 
+       layout = network_layout %>% select(x, y)) +
+  geom_edge_link0(aes(alpha = intersection_fraction)) +
+  geom_node_point(aes(size = mean_abs_z, fill = direction), shape = 21) +
+  scale_edge_alpha_continuous(range = c(0.01, 1)) +
+  scale_size(range = c(1, 4)) +
+  theme_void(base_size = 8, base_family = 'Arial') +
+  theme(aspect.ratio = 1, 
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        legend.key.size = unit(12, 'pt'),
+        panel.background = element_blank(),
+        panel.border = element_blank(),
+        plot.background = element_blank(), 
+        legend.background = element_blank(),
+        strip.background = element_blank()) +
+  scale_fill_manual(values = c('#ef8a62', '#cfdf65', '#67a9cf')) +
+  geom_node_label(aes(label = label, color = direction), repel = TRUE, size = 2.5, 
+                  min.segment.length = 0, fill = alpha('white', 0.9), 
+                  segment.size = 0.75, family = 'Arial', show.legend = F) +
+  guides(size = guide_legend(title = 'mean |z-score|'),
+         edge_alpha = guide_legend(title = 'overlap fraction', order = 1)) +
+  labs(title = 'Gene set network') 
+ggsave(here('figures', 'raw-plots', 'gene_set_network.pdf'), 
+       width = 18, height = 18, units = 'cm', device = cairo_pdf)
+```
+
+
+```{r}
+network_nodes <- network %>%
+  as_tibble()
+
+minimal_nodes <- network_nodes %>%
+  select(name) %>%
+  mutate(from = row_number())
+
+network_edges <- network %>%
+  activate(edges) %>%
+  as_tibble() %>%
+  inner_join(minimal_nodes) %>%
+  inner_join(minimal_nodes, by = c('to' = 'from'),
+             suffix = c('_from', '_to')) %>%
+  select(name_from, name_to, everything())
+
+```
+
+```{r, fig.width = 3.5, fig.height = 2.2}
+central_nodes <- network_nodes %>% 
+  filter(n > 4, module_centrality_rank <= 1) %>%
+  mutate(label = str_wrap(paste0(`term description`, 
+                                 ' (n=', `genes mapped`, ')'), 40)) %>%
+  arrange(direction, -mean_abs_z) %>%
+  mutate(label = fct_reorder(label, -row_number())) %>%
+  group_by(direction) %>%
+  top_n(3, mean_abs_z)
+ggplot(central_nodes) +
+  aes(y = label, x = mean_abs_z, fill = direction) +
+  geom_col() +
+  scale_fill_manual(values = c('#ef8a62', '#cfdf65', '#67a9cf')) +
+  theme(axis.title.y = element_blank(), 
+        axis.text.y = element_text(color = rev(RColorBrewer::brewer.pal(8, 'Dark2'))),
+        legend.position = 'top', 
+        axis.text.x = element_text(size = 6)) +
+  xlab('mean |z-score|') +
+  labs(subtitle = 'Gene set enrichment')
+ggsave(here('figures', 'raw-plots', 'gene_set_enrichment.svg'), 
+       width = 9, height = 6, units = 'cm')
+```
+
+### Outputs
+
+```{r}
+genes_pathways <- inner_join(significant_pathways_gene_scores %>% 
+                               select(`#term ID`, queryItem),network_nodes, 
+                             by = c('#term ID' = 'name')) %>%
+  rename(Gene = queryItem) %>%
+  select(Gene, everything())
+central_gene_pathways <- genes_pathways %>% inner_join(central_nodes) 
+write_csv(genes_pathways, here('data','interim', 'genes_pathways.csv'))
+write_csv(central_gene_pathways, here('data','interim', 'central_genes_pathways.csv'))
+write_csv(network_nodes, here('data', 'processed', 'gene_set_network_nodes.csv'))
+write_csv(network_edges, here('data', 'processed', 'gene_set_network_edges.csv'))
+```
+
+

@@ -1,0 +1,69 @@
+---
+title: "Map gene symbols"
+---
+
+Here we map gene IDs from the chip file to the most recent gene symbol from NCBI. 
+NCBI gene info comes from: https://ftp.ncbi.nlm.nih.gov/gene/DATA/GENE_INFO/Mammalia/
+
+And group controls into pseudogenes
+
+```{r}
+library(tidyverse)
+library(here)
+```
+
+```{r}
+ncbi_gene_info <- read_tsv(here('data', 'raw', 'All_Mammalia.gene_info'), 
+                           col_types = cols('GeneID' = col_character())) # change coltype, so it matches chip file
+chip_file <- read_tsv(here('data', 'raw','CP0070_Chlorocebus_sabeus_1.1_NCBI_strict_gene_20200102.chip')) 
+```
+
+```{r}
+# NCBI annotations
+agm_gene_info <- ncbi_gene_info %>%
+  filter(`#tax_id` == '60711') %>%
+  select(`GeneID`, Symbol) %>%
+  rename(`NCBI Symbol` = Symbol, 
+         `Gene ID` = GeneID) 
+```
+
+```{r}
+# Group controls into pseudogenes
+set.seed(7)
+control_pseudogenes <- chip_file %>%
+  filter(grepl('NO_SITE', `Gene Symbol`)) %>%
+  mutate(rand = sample(1:n(), replace = F),
+         `Pseudo Gene` = paste0('NO_SITE_', rand %% ceiling(n()/4))) %>% # group 4 controls into pseudogenes
+  select(-c(rand))
+```
+
+```{r}
+# max and min size of pseudogenes
+control_pseudogenes %>% 
+  group_by(`Pseudo Gene`) %>% 
+  summarise(n = n()) %>% 
+  ungroup() %>% 
+  summarise(max(n), min(n))
+```
+
+
+```{r}
+remapped_chip <- chip_file %>%
+  left_join(agm_gene_info) %>%
+  left_join(control_pseudogenes) %>%
+  mutate(Gene = if_else(!is.na(`NCBI Symbol`), `NCBI Symbol`, 
+                        if_else(!is.na(`Pseudo Gene`),`Pseudo Gene`, `Gene Symbol`)))
+```
+
+```{r}
+remapped_chip %>%
+  select(`Gene Symbol`, `NCBI Symbol`) %>%
+  distinct() %>%
+  drop_na() %>%
+  summarise(delta = sum(`Gene Symbol` != `NCBI Symbol`))
+```
+
+```{r}
+write_tsv(remapped_chip, here('data', 'interim', 'CP0070_Chlorocebus_sabeus_remapped.chip'))
+```
+
